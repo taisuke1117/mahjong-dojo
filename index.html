@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0d3b2e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="牌効率道場">
+<title>牌効率道場 — 一生ツモって最善手を極める</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand">牌効率道場</div>
+    <div class="hbtn">
+      <button class="ib" data-act="stats" aria-label="成績">成績</button>
+      <button class="ib" data-act="settings" aria-label="設定">設定</button>
+    </div>
+  </header>
+  <div id="info" class="info"></div>
+  <div id="rivers"></div>
+  <div id="feedback" class="fb empty"></div>
+  <div class="bottom">
+    <div class="statusrow"><span id="status"></span><div id="actions"></div></div>
+    <div id="hand"></div>
+  </div>
+</div>
+<div id="toast"></div>
+<div id="modal"><div class="mbox" id="modal-body"></div></div>
+<script src="engine.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
