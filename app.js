@@ -20,7 +20,8 @@
   const defaultStats = () => ({ hands: 0, discards: 0, best: 0, ok: 0, meh: 0, bad: 0, rage: 0, wins: 0, dealins: 0, winPts: 0, dealPts: 0, streak: 0, bestStreak: 0 });
   let stats = Object.assign(defaultStats(), store.get('mjdojo-stats', {}));
   const saveStats = () => store.set('mjdojo-stats', stats);
-  const SPEEDS = [650, 330, 120];
+  const SPEEDS = [650, 330, 120, 2000];
+  const botWait = () => settings.speed === 3 ? 1400 + Math.random() * 600 : SPEEDS[settings.speed];
 
   // ---------- 状態 ----------
   let G = null;
@@ -104,7 +105,7 @@
         act = await playerTurn();
       } else {
         render();
-        await sleep(SPEEDS[settings.speed]);
+        await sleep(botWait());
         if (G !== myHand || G.over) return;
         act = botTurn(pi);
       }
@@ -214,7 +215,7 @@
         G.myTurnActive = true;
         if (!G.canTsumo) {
           render();
-          setTimeout(() => { G.myTurnActive = false; resolve({ type: 'discard', id: G.drawn }); }, Math.max(250, SPEEDS[settings.speed]));
+          setTimeout(() => { G.myTurnActive = false; resolve({ type: 'discard', id: G.drawn }); }, Math.min(800, Math.max(250, SPEEDS[settings.speed])));
           return;
         }
         resolveTurn = resolve;
@@ -583,7 +584,7 @@
       return `<div class="river${P.riichi ? ' is-riichi' : ''}${turn}">
         <div class="rl"><span class="seat">${WIND_CH[P.seatWind - 27]}</span><span class="nm">${SEAT_NAMES[i]}</span>
         <span class="pt">${G.scores[i]}</span>${P.riichi ? '<span class="rb">リーチ</span>' : ''}</div>
-        <div class="rt">${tiles}</div></div>`;
+        <div class="rt">${tiles}</div>${turn && i !== 0 && settings.speed === 3 ? '<div class="rtimer"></div>' : ''}</div>`;
     }).join('');
     // 手牌
     let hand = me.hand.slice();
@@ -687,7 +688,7 @@
     const opt = (name, val, cur, label) => `<button class="seg${cur === val ? ' on' : ''}" data-set="${name}" data-val="${val}">${label}</button>`;
     showModal(`<h2>設定</h2>
       <div class="set"><div>怒り方</div><div class="segs">${opt('strict', 0, settings.strict, '優しめ')}${opt('strict', 1, settings.strict, '辛口')}${opt('strict', 2, settings.strict, 'ボロクソ')}</div></div>
-      <div class="set"><div>botの速さ</div><div class="segs">${opt('speed', 0, settings.speed, 'ゆっくり')}${opt('speed', 1, settings.speed, '普通')}${opt('speed', 2, settings.speed, '速い')}</div></div>
+      <div class="set"><div>botの速さ</div><div class="segs">${opt('speed', 0, settings.speed, 'ゆっくり')}${opt('speed', 1, settings.speed, '普通')}${opt('speed', 2, settings.speed, '速い')}${opt('speed', 3, settings.speed, '雀鬼(2秒)')}</div></div>
       <div class="set"><div>良い手の判定も表示</div><div class="segs">${opt('showAll', true, settings.showAll, 'する')}${opt('showAll', false, settings.showAll, '悪手だけ')}</div></div>
       <div class="set"><div>ゲームモード</div><div class="segs">${opt('mode', 'normal', settings.mode, '通常')}${opt('mode', 'sudden', settings.mode, '一発終了')}</div></div>
       <div class="set"><div>雀鬼ルール（2秒打牌・1打目字牌禁止・ノーテンのドラ切り禁止）</div><div class="segs">${opt('janki', false, settings.janki, 'なし')}${opt('janki', true, settings.janki, 'あり')}</div></div>
@@ -706,6 +707,7 @@
       const name = t.dataset.set; let val = t.dataset.val;
       val = val === 'true' ? true : val === 'false' ? false : +val;
       if ((name === 'mode' || name === 'janki') && settings[name] !== val) G.pendingRestart = true;
+      if (name === 'janki' && val === true) settings.speed = 3;
       settings[name] = val; store.set('mjdojo-settings', settings);
       showSettings(); render(); return;
     }

@@ -139,3 +139,6 @@ details{margin-top:10px;font-size:13px;color:var(--mute)}
 .note.warn{color:var(--gold)}
 .why{margin-top:6px;font-size:11px;line-height:1.55;color:#e6efe9;background:rgba(0,0,0,.2);border-radius:6px;padding:5px 7px}
 .fb td small{font-size:9px;opacity:.8}
+.river{position:relative}
+.rtimer{position:absolute;left:8px;right:8px;bottom:3px;height:3px;border-radius:2px;background:rgba(232,196,106,.85);transform-origin:left;animation:drain 2s linear forwards}
+@keyframes drain{from{transform:scaleX(1)}to{transform:scaleX(0)}}
