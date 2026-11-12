@@ -509,7 +509,170 @@
     return 31 + (k - 31 + 1) % 3;
   }
 
-  const API = { NAMES, HONOR_NAMES, KANJI_NUM, tileLabel, kindOf, isRedId, isYaochu, shanten, shantenNormal,
+  // ---------------- 読み切り型の評価（残り巡目のツモを全部読む） ----------------
+  // 一人麻雀モデル: 毎巡 unseen からランダムにツモ。有効牌を引いたら最善の打牌（期待値最大）を選ぶ。
+  // テンパイ時は和了牌でツモ/ロン（ロン分は倍率で近似）。他家の和了で局が終わる確率を毎巡考慮。
+  // 戻り値: 各候補の和了率(p)と点数期待値(ev)
+  function exactSearch(ctx, c0, remain0, W, T, redKept, turnIdx) {
+    const memo = new Map();
+    const scoreMemo = new Map();
+    const RON_MUL = 1.8;
+    const hz = []; for (let k = 0; k <= T; k++) hz.push(Math.min(0.25, 0.03 + 0.004 * (turnIdx + k)));
+    let calls = 0;
+    const keyOf = c => String.fromCharCode.apply(null, c.map(x => 48 + x));
+    const remOf = (c, x) => Math.max(0, remain0[x] - Math.max(0, c[x] - c0[x]));
+    function winScore(c, x) {
+      const key = keyOf(c) + x;
+      let v = scoreMemo.get(key);
+      if (v !== undefined) return v;
+      c[x]++;
+      const sc = scoreHand(c, { winTile: x, tsumo: false, riichi: true, ippatsu: false, seatWind: ctx.seatWind,
+        roundWind: ctx.roundWind, doraKinds: ctx.doraKinds, uraKinds: [], red: redKept, dealer: ctx.dealer });
+      c[x]--;
+      // 裏ドラ・一発・ツモの上振れ分を少し加算
+      v = sc ? sc.points * 1.22 : 0;
+      scoreMemo.set(key, v);
+      return v;
+    }
+    // 13枚の手 c (向聴 s) について、残りツモ数 t ごとの [和了率, 点数期待値] ベクトル
+    function solve(c, s) {
+      const key = keyOf(c);
+      const m = memo.get(key);
+      if (m) return m;
+      calls++;
+      const P = new Float64Array(T + 1), V = new Float64Array(T + 1);
+      if (s === 0) {
+        let pw = 0, ev = 0;
+        for (let x = 0; x < 34; x++) {
+          if (c[x] >= 4) continue;
+          const r = remOf(c, x); if (!r) continue;
+          c[x]++; const done = isComplete(c); c[x]--;
+          if (!done) continue;
+          const p = Math.min(0.9, RON_MUL * r / W);
+          pw += p; ev += p * winScore(c, x);
+        }
+        pw = Math.min(0.95, pw);
+        for (let t = 1; t <= T; t++) {
+          const keep = (1 - pw) * (1 - hz[T - t]);
+          P[t] = pw + keep * P[t - 1];
+          V[t] = ev + keep * V[t - 1];
+        }
+      } else {
+        const trans = []; // [p, childList]
+        let pe = 0;
+        for (let x = 0; x < 34; x++) {
+          if (c[x] >= 4) continue;
+          const r = remOf(c, x); if (!r) continue;
+          c[x]++;
+          if (shantenFast(c) < s) {
+            const kids = [];
+            for (let d = 0; d < 34; d++) {
+              if (!c[d] || d === x && false) continue;
+              c[d]--;
+              if (shantenFast(c) === s - 1) kids.push(solve(c, s - 1));
+              c[d]++;
+            }
+            const p = r / W;
+            pe += p;
+            trans.push([p, kids]);
+          }
+          c[x]--;
+        }
+        for (let t = 1; t <= T; t++) {
+          let pp = 0, vv = 0;
+          for (const [p, kids] of trans) {
+            let bv = -1, bp = 0;
+            for (const k of kids) if (k.V[t - 1] > bv || (k.V[t - 1] === bv && k.P[t - 1] > bp)) { bv = k.V[t - 1]; bp = k.P[t - 1]; }
+            if (bv < 0) bv = 0;
+            pp += p * bp; vv += p * bv;
+          }
+          const surv = 1 - hz[T - t];
+          P[t] = surv * (pp + (1 - pe) * P[t - 1]);
+          V[t] = surv * (vv + (1 - pe) * V[t - 1]);
+        }
+      }
+      const res = { P, V };
+      memo.set(key, res);
+      return res;
+    }
+    return { solve, stats: () => ({ states: memo.size, calls }) };
+  }
+  const shCache = new Map();
+  function shantenFast(c) {
+    const key = String.fromCharCode.apply(null, c.map(x => 48 + x));
+    let v = shCache.get(key);
+    if (v === undefined) { v = shanten(c); if (shCache.size > 400000) shCache.clear(); shCache.set(key, v); }
+    return v;
+  }
+
+  // 改良版: 向聴2以内は読み切り、それ以上は近似
+  function evaluateDiscards2(ctx) {
+    const base = evaluateDiscards(ctx); // 受け入れ・危険度・近似値（表示用・遠い手用）
+    const c = new Array(34).fill(0);
+    for (const id of ctx.hand) c[kindOf(id)]++;
+    const remain = new Array(34);
+    for (let i = 0; i < 34; i++) remain[i] = Math.max(0, 4 - ctx.visible[i]);
+    let W = 0; for (let i = 0; i < 34; i++) W += remain[i];
+    W = Math.max(W, 20);
+    const T = Math.max(0, Math.min(18, Math.floor(ctx.wallLeft / 4)));
+    const redTotal = ctx.hand.filter(isRedId).length;
+    const minS = Math.min(...base.map(x => x.s));
+    const opps = ctx.riichiOpps || [];
+    const remainSee = remain;
+    if (minS <= 2 && T > 0) {
+      const searchers = {};
+      const t0 = Date.now();
+      for (const x of base) {
+        if (x.s > 2 || x.s < 0) continue;
+        const redKept = redTotal - (x.red ? 1 : 0);
+        const S = searchers[redKept] || (searchers[redKept] = exactSearch(ctx, c, remain, W, T, redKept, ctx.turnIdx || 0));
+        c[x.kind]--;
+        const r = S.solve(c, x.s);
+        c[x.kind]++;
+        x.pWin = r.P[T];
+        x.atk = r.V[T];
+        x.pts = x.pWin > 0 ? x.atk / x.pWin : 0;
+        x.exact = true;
+      }
+      // 遠い候補（向聴3以上）は近似値を読み切り値のスケールに合わせる
+      const ex = base.filter(x => x.exact);
+      const far = base.filter(x => !x.exact && x.s >= 0);
+      if (ex.length && far.length) {
+        const worst = Math.min(...ex.map(x => x.atk));
+        for (const x of far) { x.atk = Math.min(x.atk, worst * 0.9); }
+      }
+      base.searchMs = Date.now() - t0;
+    }
+    // 押し引きを付け直す
+    for (const x of base) {
+      let value = x.atk, mode = 'attack';
+      if (opps.length) {
+        const L = opps.reduce((a, o) => a + (o.dealer ? 9000 : 6000), 0) / opps.length;
+        // 押し続けた場合に今後危険牌を切る分のリスク（向聴が深いほど大きい）
+        const pushTurns = Math.min(T, [1.5, 4, 7, 9][Math.min(3, Math.max(0, x.s))] + 0);
+        const future = pushTurns * 0.035 * opps.length * L * (1 - x.pWin * 0.5);
+        const push = x.atk - x.deal * L - future;
+        const fold = -x.deal * L - T * 0.004 * opps.length * L;
+        if (fold > push) { value = fold; mode = 'fold'; } else value = push;
+        x.dealBy = opps.map(o => ({ idx: o.idx, d: tileDanger(x.kind, o, remainSee), safe: o.safe.has(x.kind), cls: dangerClass(x.kind, o) }));
+      }
+      x.value = value; x.mode = mode;
+    }
+    base.sort((a, b) => b.value - a.value || a.s - b.s || b.u - a.u);
+    return base;
+  }
+  function dangerClass(t, opp) {
+    if (opp.safe.has(t)) return '現物';
+    if (t >= 27) return '字牌';
+    const b = t - t % 9, n = t % 9;
+    const s1 = n <= 5 ? opp.safe.has(b + n + 3) : true;
+    const s2 = n >= 3 ? opp.safe.has(b + n - 3) : true;
+    if (s1 && s2) return n === 0 || n === 8 ? 'スジ' : (n >= 3 && n <= 5 ? '両スジ' : 'スジ');
+    if (s1 || s2) return (n >= 3 && n <= 5) ? '片スジ' : 'スジ';
+    return '無筋';
+  }
+
+  const API = { evaluateDiscards2, exactSearch, dangerClass, NAMES, HONOR_NAMES, KANJI_NUM, tileLabel, kindOf, isRedId, isYaochu, shanten, shantenNormal,
     shantenChiitoi, shantenKokushi, ukeire, nextUkeire, winProb, hanToPoints, handValueHan, tileDanger, dealInRate,
     evaluateDiscards, decompose, isComplete, waitsOf, scoreHand, doraFromIndicator };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;

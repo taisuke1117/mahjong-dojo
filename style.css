@@ -127,3 +127,15 @@ details{margin-top:10px;font-size:13px;color:var(--mute)}
 .note{font-size:12px;color:var(--mute);line-height:1.6}
 .shake{animation:shake .38s}
 @keyframes shake{20%{transform:translateX(-7px)}40%{transform:translateX(6px)}60%{transform:translateX(-4px)}80%{transform:translateX(3px)}}
+
+.chip{border-radius:5px;padding:1px 6px;font-weight:800;font-size:11px}
+.chip.janki{background:#1a1a1a;color:#ff5a4a;border:1px solid #ff5a4a}
+.chip.sd{background:var(--gold);color:#2a1f00}
+#timer{height:5px;border-radius:3px;background:rgba(255,255,255,.08);overflow:hidden;visibility:hidden}
+#timer.on{visibility:visible}
+#timer>div{height:100%;width:100%;background:linear-gradient(90deg,#ff4a3a,#ffd36b)}
+.vio{margin-top:4px;font-size:12px;font-weight:800;color:#ffd0c8;background:rgba(0,0,0,.25);border-radius:6px;padding:3px 7px}
+.go-msg{text-align:center;font-size:14px;line-height:1.6}
+.note.warn{color:var(--gold)}
+.why{margin-top:6px;font-size:11px;line-height:1.55;color:#e6efe9;background:rgba(0,0,0,.2);border-radius:6px;padding:5px 7px}
+.fb td small{font-size:9px;opacity:.8}

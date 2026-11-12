@@ -13,7 +13,10 @@
     get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* noop */ } }
   };
-  const settings = Object.assign({ strict: 1, speed: 1, showAll: true }, store.get('mjdojo-settings', {}));
+  const settings = Object.assign({ strict: 1, speed: 1, showAll: true, mode: 'normal', janki: false }, store.get('mjdojo-settings', {}));
+  const records = store.get('mjdojo-records', {});
+  const recKey = () => 'sudden' + (settings.janki ? '-janki' : '');
+  const isSudden = () => settings.mode === 'sudden';
   const defaultStats = () => ({ hands: 0, discards: 0, best: 0, ok: 0, meh: 0, bad: 0, rage: 0, wins: 0, dealins: 0, winPts: 0, dealPts: 0, streak: 0, bestStreak: 0 });
   let stats = Object.assign(defaultStats(), store.get('mjdojo-stats', {}));
   const saveStats = () => store.set('mjdojo-stats', stats);
@@ -114,7 +117,7 @@
       doDiscard(pi, act.id);
       render();
       const ron = await checkRon(pi, act.id);
-      if (G !== myHand) return;
+      if (G !== myHand || G.over) return;
       if (ron !== null) return win(ron, pi, act.id);
       G.turn = (pi + 1) % 4;
     }
@@ -151,6 +154,7 @@
       Q.tempFuriten = true;
       if (Q.riichi) Q.riichiFuriten = true;
       judgeMissedWin('ロン');
+      if (isSudden()) { gameOver('和了り見逃し', G.feedback.msg); return null; }
     }
     return null;
   }
@@ -205,7 +209,7 @@
       G.canTsumo = !!scoreFor(0, G.drawn, true) && E.isComplete(counts(P.hand));
       riichiMode = false;
       tenpaiKinds = null;
-      G.eval = null;
+      G.eval = null; G.evalPromise = null;
       if (P.riichi) {
         G.myTurnActive = true;
         if (!G.canTsumo) {
@@ -224,22 +228,62 @@
       G.canRiichi = tenpaiKinds.size > 0 && G.wall.length >= 4 && G.scores[0] >= 1000;
       G.myTurnActive = true;
       resolveTurn = resolve;
+      G.turnStart = performance.now();
+      G.late = false;
+      const token = G.turnToken = (G.turnToken || 0) + 1;
       render();
-      setTimeout(() => { if (G.myTurnActive && !G.eval) computeEval(); }, 30);
+      if (settings.janki) {
+        startTimerBar();
+        setTimeout(() => {
+          if (G.turnToken !== token || !G.myTurnActive || G.over) return;
+          G.late = true;
+          const L = settings.strict;
+          flash(JANKI_MSG.late[L]);
+          shake();
+          stats.janki = (stats.janki || 0) + 1; saveStats();
+          if (isSudden()) gameOver('打牌が2秒を超えた', JANKI_MSG.late[L]);
+        }, 2000);
+      }
+      computeEval();
     });
   }
-  function computeEval() {
+  // 判定はWeb Workerで裏計算（UIを止めない）
+  let worker = null, reqId = 0;
+  const pending = new Map();
+  try {
+    if (location.protocol.startsWith('http')) {
+      worker = new Worker('worker.js');
+      worker.onmessage = e => { const f = pending.get(e.data.id); if (f) { pending.delete(e.data.id); f(e.data); } };
+      worker.onerror = () => { worker = null; };
+    }
+  } catch (e) { worker = null; }
+  function evalCtx() {
     const P = G.players[0];
-    const t0 = performance.now();
-    G.eval = E.evaluateDiscards({
-      hand: P.hand, visible: visibleFor(0), wallLeft: G.wall.length, turnIdx: G.myTurns,
+    return {
+      hand: P.hand.slice(), visible: visibleFor(0), wallLeft: G.wall.length, turnIdx: G.myTurns,
       doraKinds: doraKinds(G.doraInd), seatWind: P.seatWind, roundWind: G.roundWind,
       dealer: G.dealer === 0, riichiOpps: riichiOppsFor(0)
-    });
-    G.evalMs = performance.now() - t0;
+    };
   }
-  function onTileTap(id) {
-    if (!G || !G.myTurnActive || !resolveTurn) return;
+  function computeEval() {
+    const g = G, ctx = evalCtx();
+    const t0 = performance.now();
+    if (worker) {
+      g.evalPromise = new Promise(res => {
+        const id = ++reqId;
+        pending.set(id, d => { g.eval = d.ev; g.evalMs = performance.now() - t0; res(); });
+        worker.postMessage({ id, ctx });
+      });
+    } else {
+      g.eval = E.evaluateDiscards2(ctx);
+      g.evalMs = performance.now() - t0;
+      g.evalPromise = Promise.resolve();
+    }
+    return g.evalPromise;
+  }
+  async function onTileTap(id) {
+    if (!G || !G.myTurnActive || !resolveTurn || G.judging) return;
+    const tapT = performance.now();
     const P = G.players[0];
     if (P.riichi) {
       if (id !== G.drawn) return;
@@ -248,12 +292,26 @@
       flash('テンパイが崩れる牌はリーチ宣言牌にできません');
       return;
     }
+    G.turnToken = (G.turnToken || 0) + 1; // 2秒タイマーを無効化
+    stopTimerBar();
     if (!P.riichi) {
-      if (!G.eval) computeEval();
       if (G.canTsumo) judgeMissedWin('ツモ');
-      else judge(id);
+      else {
+        G.judging = true;
+        if (!G.evalPromise) computeEval();
+        if (!G.eval) { $('#status').textContent = '判定中…'; await G.evalPromise; }
+        G.judging = false;
+        judge(id, tapT);
+      }
       G.myTurns++;
     }
+    if (isSudden() && G.feedback && G.feedback.fail && !G.over) {
+      resolveTurn = null; G.myTurnActive = false;
+      render();
+      gameOver(G.feedback.failReason, G.feedback.msg);
+      return;
+    }
+    if (G.over || !resolveTurn) return;
     const r = resolveTurn; resolveTurn = null; G.myTurnActive = false;
     r({ type: 'discard', id, riichi: riichiMode && !P.riichi });
     riichiMode = false;
@@ -281,28 +339,36 @@
   // ---------- 判定 ----------
   const MSG = {
     shanten: [
-      'あれ、シャンテン数が戻っちゃったよ。{best}切りなら前に進めてたね',
-      'シャンテン戻してどうすんの。{best}切りでしょ',
+      'あれ、向聴数が戻っちゃったよ。{best}切りなら{bs}向聴のまま進めたね',
+      '向聴戻してどうすんの。{best}切りでしょ',
       'は？向聴戻し？手牌ちゃんと見えてる？{best}切りなんだけど'],
+    torazu: [
+      '{cs}向聴に進めたけど、ここは{best}切りで形を残す方が期待値が高いよ',
+      '進めるのはいいけど待ち・打点が悪すぎ。{best}切りで構えた方が得',
+      '目先の向聴数に飛びつくな。{best}切りで構える場面だぞ'],
     ukeire: [
-      '受け入れが{uc}枚になっちゃった。{best}切りなら{ub}枚あったよ',
-      '受け入れ{uc}枚って…{best}切りなら{ub}枚。ちゃんと数えて',
+      '受け入れが{uc}枚になっちゃった。{best}切りなら{ub}枚（同じ{bs}向聴）',
+      '同じ{bs}向聴で受け入れ{uc}枚 vs {ub}枚。{best}切りでしょ',
       '{uc}枚？{best}切りなら{ub}枚あるんだが？牌効率イチからやり直し'],
     danger: [
-      'リーチに危ない牌だったね。放銃率 約{dc}%（{best}なら約{db}%）',
-      'リーチに無筋ぶっ放し？放銃率 約{dc}%だよ。{best}で回って',
-      'リーチ見えてる？約{dc}%で刺さる牌を押す手じゃないから。{best}で降りろ'],
+      '{who}のリーチに{cls}の{tile}は危ないよ（放銃率 約{dc}%）。{best}なら約{db}%',
+      '{who}のリーチに{cls}{tile}ぶっ放し？放銃率 約{dc}%だよ。{best}で回って',
+      '{who}のリーチ見えてる？{cls}の{tile}とか約{dc}%で刺さるぞ。{best}'],
     fold: [
-      'この手は押すより降りた方が得だったかも。{best}が安全だよ',
-      'その手で押す？期待値マイナスだよ。{best}でベタオリ',
-      '押し引き壊れてる？その手で勝負になるわけないでしょ。{best}'],
+      'この手で{who}のリーチに押すのは損かも。{best}が安全だよ（{bcls}）',
+      'その手で押す？期待値マイナスだよ。{best}（{bcls}）でオリ',
+      '押し引き壊れてる？その手で勝負になるわけないでしょ。{best}（{bcls}）'],
+    push: [
+      'この手なら押して良かったよ。{best}切りで前に出よう',
+      'オリすぎ。この手は{best}切りで押す場面',
+      'ビビりすぎ。この手でオリてどうすんの。{best}で押せ'],
     value: [
-      '打点が下がっちゃったね。{best}切りなら打点を保てたよ',
+      '和了率は近いけど打点が下がっちゃったね。{best}切りなら打点を保てたよ',
       'なんで打点捨てるの？{best}切りでしょ',
-      'ドラ・打点をドブに捨てるな。{best}一択'],
+      'ドラ・役をドブに捨てるな。{best}一択'],
     shape: [
-      '受け入れは近いけど、{best}切りの方が好形になりやすいよ',
-      '{best}切りの方が良い待ちになりやすい。形を見て',
+      '受け入れは近いけど、{best}切りの方が良い待ちになりやすいよ',
+      '{best}切りの方が良形になりやすい。形を見て',
       '形が見えてない。{best}切りの方が明確に好形だぞ'],
     generic: [
       '{best}切りの方が良かったね',
@@ -314,12 +380,22 @@
   const RAGE_PREFIX = ['', 'ちょっと待って。', 'おい！！'];
   const fill = (s, v) => s.replace(/\{(\w+)\}/g, (_, k) => v[k] !== undefined ? v[k] : '');
   const pick = a => a[Math.floor(Math.random() * a.length)];
+  const pct = x => (x * 100).toFixed(x < 0.1 ? 1 : 0);
 
-  function judge(id) {
+  function judge(id, tapT) {
     const ev = G.eval; if (!ev || !ev.length) return;
     const k = kindOf(id), red = isRed(id);
     const chosen = ev.find(x => x.kind === k && x.red === red) || ev.find(x => x.kind === k);
-    const best = ev[0];
+    // 雀鬼ルール: 禁止打牌は最善候補から外す（全部禁止なら仕方なし）
+    const best = ev.find(x => !jankiIllegal(x)) || ev[0];
+    const violations = [];
+    const L = settings.strict;
+    const ill = jankiIllegal(chosen);
+    if (ill && jankiIllegal(best) === null) { violations.push(JANKI_MSG[ill][L]); stats.janki = (stats.janki || 0) + 1; }
+    if (settings.janki && ((tapT || performance.now()) - G.turnStart > 2000)) {
+      violations.push(JANKI_MSG.late[L]);
+      if (!G.late) stats.janki = (stats.janki || 0) + 1;
+    }
     const diff = best.value - chosen.value;
     const scale = Math.max(250, Math.abs(best.value));
     const rel = diff / scale;
@@ -327,35 +403,108 @@
     if (chosen === best || diff <= 1) grade = 'best';
     else if (diff < 40 || rel < 0.06) grade = 'ok';
     else if (diff < 200 && rel < 0.25) grade = 'meh';
-    else grade = (diff > 700 ? 'rage' : 'bad');
-    const L = settings.strict;
-    const bestName = E.tileLabel(best.kind, best.red);
-    const v = { best: bestName, uc: chosen.u, ub: best.u, dc: (chosen.deal * 100).toFixed(0), db: (best.deal * 100).toFixed(0) };
+    else grade = (diff > 800 && rel > 0.5 ? 'rage' : 'bad');
+    // 向聴を進めた打牌は「構え」の判断なので甘めに（近似の誤差も考慮）
+    if (chosen.s < best.s && (grade === 'bad' || grade === 'rage') && rel < 0.4) grade = 'meh';
+    if (!best.exact && !chosen.exact && chosen.s === best.s && (grade === 'bad' || grade === 'rage') && rel < 0.35) grade = 'meh';
+
+    const bestName = E.tileLabel(best.kind, best.red), chName = E.tileLabel(chosen.kind, chosen.red);
+    const sName = x => x === 0 ? 'テンパイ' : x + '向聴';
+    const v = { best: bestName, tile: chName, uc: chosen.u, ub: best.u, bs: best.s, cs: chosen.s,
+      dc: pct(chosen.deal), db: pct(best.deal) };
+    // 危険の内訳（誰に対して危ないか）
+    if (chosen.dealBy && chosen.dealBy.length) {
+      const worst = chosen.dealBy.slice().sort((a, b) => b.d - a.d)[0];
+      v.who = SEAT_NAMES[worst.idx]; v.cls = worst.cls;
+      const bw = best.dealBy.slice().sort((a, b) => b.d - a.d)[0];
+      v.bcls = best.dealBy.every(o => o.safe) ? (best.dealBy.length > 1 ? 'リーチ者全員に現物' : SEAT_NAMES[best.dealBy[0].idx] + 'に現物') : (SEAT_NAMES[bw.idx] + 'に' + bw.cls);
+    }
     let reason = 'generic';
-    if (chosen.deal - best.deal > 0.03 && best.mode === 'fold') reason = chosen.mode === 'fold' ? 'danger' : 'fold';
-    else if (chosen.deal - best.deal > 0.04) reason = 'danger';
+    const anyRiichi = chosen.dealBy && chosen.dealBy.length;
+    if (anyRiichi && chosen.deal - best.deal > 0.02) reason = best.mode === 'fold' ? 'fold' : 'danger';
+    else if (anyRiichi && chosen.mode === 'fold' && best.mode !== 'fold' && chosen.deal < best.deal) reason = 'push';
     else if (chosen.s > best.s) reason = 'shanten';
-    else if (chosen.u < best.u - 1) reason = 'ukeire';
-    else if (chosen.han < best.han - 0.4) reason = 'value';
-    else if (chosen.u2 < best.u2 - 0.5) reason = 'shape';
+    else if (chosen.s < best.s) reason = 'torazu';
+    else if (chosen.u < best.u - 1 && chosen.pWin < best.pWin * 0.95) reason = 'ukeire';
+    else if (chosen.pts < best.pts * 0.88) reason = 'value';
+    else if (chosen.pWin < best.pWin) reason = 'shape';
+    // 根拠の数字
+    const why = [];
+    why.push(`${chName}: ${sName(chosen.s)} 受入${chosen.u}枚 和了率${pct(chosen.pWin)}% 打点${Math.round(chosen.pts / 100) * 100}`);
+    why.push(`${bestName}: ${sName(best.s)} 受入${best.u}枚 和了率${pct(best.pWin)}% 打点${Math.round(best.pts / 100) * 100}`);
+    if (anyRiichi) {
+      const fmt = x => x.dealBy.map(o => `${SEAT_NAMES[o.idx]}に${o.cls}`).join('・');
+      why.push(`危険度 ${chName}: ${fmt(chosen)}（約${pct(chosen.deal)}%） / ${bestName}: ${fmt(best)}（約${pct(best.deal)}%）`);
+    }
     let msg;
     if (grade === 'best') msg = pick(GOOD[0]);
     else if (grade === 'ok') msg = pick(GOOD[1]) + (settings.strict > 0 ? `（最善は${bestName}切り）` : '');
     else if (grade === 'meh') msg = fill(MILD[L], v);
     else msg = (grade === 'rage' ? RAGE_PREFIX[L] : '') + fill(MSG[reason][L], v);
     stats.discards++;
+    const badMove = grade === 'bad' || grade === 'rage';
+    let label = null;
+    if (violations.length) {
+      label = '雀鬼流違反';
+      msg = violations.join(' ／ ') + (badMove || grade === 'meh' ? `<br><small>さらに：${msg}</small>` : '');
+    }
     stats[grade]++;
-    if (grade === 'best' || grade === 'ok') { stats.streak++; stats.bestStreak = Math.max(stats.bestStreak, stats.streak); }
-    else if (grade === 'bad' || grade === 'rage') stats.streak = 0;
+    if (!violations.length && (grade === 'best' || grade === 'ok')) { stats.streak++; stats.bestStreak = Math.max(stats.bestStreak, stats.streak); }
+    else if (badMove || violations.length) stats.streak = 0;
     saveStats();
-    G.feedback = { grade, msg, chosen, best, ev: ev.slice(), ms: G.evalMs, reason };
-    if (grade === 'bad' || grade === 'rage') shake();
+    G.feedback = { grade: violations.length && !badMove ? 'bad' : grade, msg, label, chosen, best, ev: ev.slice(), ms: G.evalMs, reason,
+      why: grade === 'best' ? [] : why, violations: [],
+      fail: badMove || violations.length > 0,
+      failReason: violations.length ? '雀鬼流違反' : '悪手' };
+    if (badMove || violations.length) shake();
+  }
+  function jankiIllegal(x) {
+    if (!settings.janki || !x) return null;
+    if (G.myTurns === 0 && x.kind >= 27) return 'first';
+    const dk = doraKinds(G.doraInd);
+    if (x.s > 0 && (dk.includes(x.kind) || x.red)) return 'dora';
+    return null;
+  }
+  const JANKI_MSG = {
+    first: ['1打目に字牌は切らないのが雀鬼流だよ', '1打目に字牌切り？雀鬼流では禁止だぞ', '第一打に字牌？雀鬼流なら即破門だぞ'],
+    dora: ['テンパイしてないのにドラは切らないのが雀鬼流だよ', 'ノーテンでドラ切り？雀鬼流違反', 'ノーテンでドラ切るとか雀鬼流ナメてんの？'],
+    late: ['打牌は2秒以内に！', '遅い！2秒以内に切れ', '遅すぎ。考えてる暇なんてないぞ']
+  };
+  function startTimerBar() {
+    const el = $('#timer'); if (!el) return;
+    el.classList.add('on');
+    const bar = el.firstElementChild;
+    bar.style.transition = 'none'; bar.style.width = '100%';
+    void bar.offsetWidth;
+    bar.style.transition = 'width 2s linear'; bar.style.width = '0%';
+  }
+  function stopTimerBar() {
+    const el = $('#timer'); if (!el) return;
+    el.classList.remove('on');
+  }
+  function gameOver(reason, msg) {
+    G.over = true; G.myTurnActive = false; resolveTurn = null;
+    stopTimerBar();
+    const key = recKey();
+    const prev = records[key] || 0;
+    const run = G.run || 0;
+    const isNew = run > prev;
+    if (isNew) { records[key] = run; store.set('mjdojo-records', records); }
+    render();
+    const ev = G.feedback && G.feedback.ev;
+    const f = G.feedback;
+    setTimeout(() => showModal(`<h2 class="bad">終了：${reason}</h2>
+      <p class="go-msg">${msg || ''}</p>
+      ${reason === '悪手' && f && f.best && f.ev ? `<p class="go-msg">最善は <b>${E.tileLabel(f.best.kind, f.best.red)}</b> 切りでした</p>` : ''}
+      <div class="pts">記録 <b>${run}局</b></div>
+      <div class="ura">${isNew ? '自己ベスト更新！' : `自己ベスト ${prev}局`}（${settings.janki ? '雀鬼ルールあり' : '通常ルール'}）</div>
+      <button class="b big" data-act="newrun">もう一度</button>`), 450);
   }
   function judgeMissedWin(kind) {
     const L = settings.strict;
     const msgs = ['和了れたよ！見逃しはもったいない', `${kind}できるのに見逃すな！`, `は？？${kind}あるのに見逃し？？和了り方忘れた？`];
     stats.discards++; stats.rage++; stats.streak = 0; saveStats();
-    G.feedback = { grade: 'rage', msg: msgs[L], ev: null };
+    G.feedback = { grade: 'rage', msg: msgs[L], ev: null, fail: true, failReason: '和了り見逃し' };
     shake();
   }
 
@@ -371,6 +520,7 @@
     G.scores[wi] += sc.points + G.pot;
     const pot = G.pot; G.pot = 0;
     stats.hands++;
+    if (isSudden()) G.run = (G.run || 0) + 1;
     if (wi === 0) { stats.wins++; stats.winPts += sc.points; }
     if (from === 0) { stats.dealins++; stats.dealPts += sc.points; }
     saveStats();
@@ -384,6 +534,7 @@
     const n = ten.filter(Boolean).length;
     if (n > 0 && n < 4) for (let i = 0; i < 4; i++) G.scores[i] += ten[i] ? 3000 / n : -3000 / (4 - n);
     stats.hands++; saveStats();
+    if (isSudden()) G.run = (G.run || 0) + 1;
     showResult({ title: '流局', ten });
   }
   function nextHand() {
@@ -419,7 +570,9 @@
     const wind = WIND_CH[G.roundWind - 27];
     $('#info').innerHTML = `<b>${wind}${G.dealer + 1}局</b><span>残り <b>${G.wall.length}</b></span>
       <span class="dora">ドラ表示 ${G.doraInd.map(id => tileHTML(id, { cls: 'xs' })).join('')}</span>
-      <span>供託 ${G.pot / 1000}</span>`;
+      <span>供託 ${G.pot / 1000}</span>
+      ${settings.janki ? '<span class="chip janki">雀鬼</span>' : ''}
+      ${isSudden() ? `<span class="chip sd">一発終了 ${G.run || 0}局 / 最高${records[recKey()] || 0}</span>` : ''}`;
     // 河
     const order = [2, 3, 1, 0];
     $('#rivers').innerHTML = order.map(i => {
@@ -461,8 +614,9 @@
   function renderFeedback() {
     const f = G.feedback, el = $('#feedback');
     if (!f) { el.className = 'fb empty'; el.innerHTML = '<div class="fb-hint">切った牌をその都度AIが判定します</div>'; return; }
-    if (!settings.showAll && (f.grade === 'best' || f.grade === 'ok')) { el.className = 'fb empty'; el.innerHTML = `<div class="fb-hint">${GRADE_UI[f.grade][0]} ${f.msg}</div>`; return; }
-    const [mark, label] = GRADE_UI[f.grade];
+    if (!settings.showAll && (f.grade === 'best' || f.grade === 'ok') && !(f.violations && f.violations.length)) { el.className = 'fb empty'; el.innerHTML = `<div class="fb-hint">${GRADE_UI[f.grade][0]} ${f.msg}</div>`; return; }
+    const [mark, label0] = GRADE_UI[f.grade];
+    const label = f.label || label0;
     let detail = '';
     if (f.ev) {
       const rows = f.ev.slice(0, 6);
@@ -471,12 +625,14 @@
       detail = `<table><tr><th>打牌</th><th>向聴</th><th>受入</th><th>和了率</th><th>打点</th>${anyDeal ? '<th>放銃</th>' : ''}<th>評価</th></tr>` +
         rows.map(x => `<tr class="${x === f.chosen ? 'me' : ''}${x === f.best ? ' bst' : ''}">
           <td>${tileHTML({ k: x.kind, red: x.red }, { cls: 'xs' })}</td><td>${x.s < 0 ? '和' : x.s}</td><td>${x.u}</td>
-          <td>${(x.pWin * 100).toFixed(0)}%</td><td>${Math.round(x.pts / 100) * 100}</td>
-          ${anyDeal ? `<td>${(x.deal * 100).toFixed(0)}%</td>` : ''}<td>${x.mode === 'fold' ? 'オリ ' : ''}${Math.round(x.value)}</td></tr>`).join('') +
-        `</table><div class="fb-note">評価＝和了率×打点−放銃リスク（点の期待値）。計算 ${f.ms ? f.ms.toFixed(0) : '-'}ms</div>`;
+          <td>${pct(x.pWin)}%${x.exact ? '' : '<small>≈</small>'}</td><td>${Math.round(x.pts / 100) * 100}</td>
+          ${anyDeal ? `<td>${pct(x.deal)}%<br><small>${(x.dealBy || []).map(o => o.cls).join('/')}</small></td>` : ''}<td>${x.mode === 'fold' ? 'オリ ' : ''}${Math.round(x.value)}</td></tr>`).join('') +
+        `</table>${f.why && f.why.length ? `<div class="why">${f.why.map(w => `<div>${w}</div>`).join('')}</div>` : ''}
+        <div class="fb-note">評価＝和了率×打点−放銃リスク（点の期待値）。2向聴以内は残り${Math.min(18, Math.floor((G.wall ? G.wall.length : 0) / 4))}巡ほどのツモを読み切り、実際の役・ドラで点数計算（リーチ前提）。≈は近似。計算 ${f.ms ? f.ms.toFixed(0) : '-'}ms</div>`;
     }
-    el.className = 'fb g-' + f.grade;
-    el.innerHTML = `<div class="fb-top"><div class="mark">${mark}</div><div class="fb-msg"><div class="lbl">${label}</div>${f.msg}</div>
+    const vio = f.violations && f.violations.length ? `<div class="vio">雀鬼流違反：${f.violations.join(' / ')}</div>` : '';
+    el.className = 'fb g-' + (vio && (f.grade === 'best' || f.grade === 'ok' || f.grade === 'meh') ? 'bad' : f.grade);
+    el.innerHTML = `<div class="fb-top"><div class="mark">${mark}</div><div class="fb-msg"><div class="lbl">${label}</div>${f.msg}${vio}</div>
       ${detail ? '<button class="more" data-act="detail">詳細</button>' : ''}</div><div class="fb-detail${G.showDetail ? ' open' : ''}">${detail}</div>`;
   }
   function shake() {
@@ -505,6 +661,7 @@
       body += `<ul class="yaku">${G.players.map((p, i) => `<li><span>${SEAT_NAMES[i]}</span><span>${r.ten[i] ? 'テンパイ' : 'ノーテン'}</span></li>`).join('')}</ul>`;
     }
     body += `<details><summary>他家の手牌を見る</summary>${[1, 2, 3].map(i => `<div class="oh"><span>${SEAT_NAMES[i]}</span><div>${G.players[i].hand.map(id => tileHTML(id, { cls: 'xs' })).join('')}</div></div>`).join('')}</details>`;
+    if (isSudden()) body += `<div class="ura">一発終了モード：ノーミス <b>${G.run}局</b> 達成中</div>`;
     body += `<button class="b big" data-act="next">次の局へ</button>`;
     setTimeout(() => showModal(body), 500);
   }
@@ -518,6 +675,8 @@
       <li><span>○ 許容</span><span>${pct(s.ok)}</span></li>
       <li><span>△ 疑問手</span><span>${pct(s.meh)}</span></li>
       <li><span>✕ 悪手</span><span>${pct(s.bad + s.rage)}</span></li>
+      <li><span>雀鬼流違反</span><span>${s.janki || 0}回</span></li>
+      <li><span>一発終了 最高記録</span><span>通常 ${records.sudden || 0}局 / 雀鬼 ${records['sudden-janki'] || 0}局</span></li>
       <li><span>連続ノーミス（最高）</span><span>${s.streak}（${s.bestStreak}）</span></li>
       <li><span>和了率</span><span>${s.hands ? (s.wins / s.hands * 100).toFixed(1) : 0}%</span></li>
       <li><span>放銃率</span><span>${s.hands ? (s.dealins / s.hands * 100).toFixed(1) : 0}%</span></li>
@@ -530,7 +689,10 @@
       <div class="set"><div>怒り方</div><div class="segs">${opt('strict', 0, settings.strict, '優しめ')}${opt('strict', 1, settings.strict, '辛口')}${opt('strict', 2, settings.strict, 'ボロクソ')}</div></div>
       <div class="set"><div>botの速さ</div><div class="segs">${opt('speed', 0, settings.speed, 'ゆっくり')}${opt('speed', 1, settings.speed, '普通')}${opt('speed', 2, settings.speed, '速い')}</div></div>
       <div class="set"><div>良い手の判定も表示</div><div class="segs">${opt('showAll', true, settings.showAll, 'する')}${opt('showAll', false, settings.showAll, '悪手だけ')}</div></div>
-      <p class="note">ルール：赤ドラ3枚・鳴きなし・一局ごとに親が回る東南の繰り返し。点数が0未満になると全員25000点に戻ります。</p>
+      <div class="set"><div>ゲームモード</div><div class="segs">${opt('mode', 'normal', settings.mode, '通常')}${opt('mode', 'sudden', settings.mode, '一発終了')}</div></div>
+      <div class="set"><div>雀鬼ルール（2秒打牌・1打目字牌禁止・ノーテンのドラ切り禁止）</div><div class="segs">${opt('janki', false, settings.janki, 'なし')}${opt('janki', true, settings.janki, 'あり')}</div></div>
+      ${G.pendingRestart ? '<p class="note warn">モードを変えたので、閉じると新しく始まります</p>' : ''}
+      <p class="note">一発終了：✕悪手・和了り見逃し・（雀鬼ルールありなら）雀鬼流違反で即終了。何局ノーミスで打てるかを競います。<br>ルール：赤ドラ3枚・鳴きなし・一局ごとに親が回る東南の繰り返し。点数が0未満になると全員25000点に戻ります。</p>
       <button class="b sub" data-act="restart">この局をやり直す</button>
       <button class="b big" data-act="close">閉じる</button>`);
   }
@@ -543,6 +705,7 @@
     if (t.dataset.set) {
       const name = t.dataset.set; let val = t.dataset.val;
       val = val === 'true' ? true : val === 'false' ? false : +val;
+      if ((name === 'mode' || name === 'janki') && settings[name] !== val) G.pendingRestart = true;
       settings[name] = val; store.set('mjdojo-settings', settings);
       showSettings(); render(); return;
     }
@@ -554,14 +717,23 @@
       case 'skip': answerRon(false); break;
       case 'detail': G.showDetail = !G.showDetail; renderFeedback(); break;
       case 'next': nextHand(); break;
-      case 'close': hideModal(); break;
+      case 'close': hideModal(); if (G.pendingRestart) { G.pendingRestart = false; newRun(); } break;
+      case 'newrun': newRun(); break;
       case 'stats': showStats(); break;
       case 'settings': showSettings(); break;
       case 'reset-stats': stats = defaultStats(); saveStats(); showStats(); break;
       case 'restart': hideModal(); resolveTurn = null; ronResolve = null; G.ronOffer = null; G.over = true; G = Object.assign(G, {}); restartHand(); break;
     }
   });
+  function newRun() {
+    resolveTurn = null; ronResolve = null; stopTimerBar();
+    if (G) { G.over = true; G.ronOffer = null; }
+    G = { handNo: 0, scores: [25000, 25000, 25000, 25000], pot: 0, run: 0 };
+    store.set('mjdojo-handno', 0); store.set('mjdojo-scores', G.scores);
+    startHand();
+  }
   function restartHand() {
+    if (isSudden()) return newRun();
     const keep = { handNo: G.handNo, scores: G.scores, pot: 0 };
     G = keep;
     startHand();
